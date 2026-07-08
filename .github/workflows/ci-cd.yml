@@ -1,0 +1,167 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+      
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      
+      - name: Run ESLint
+        run: pnpm lint
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+      
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      
+      - name: Run unit tests
+        run: pnpm test:unit
+        env:
+          MONGODB_URI: mongodb://localhost:27017/jobcopilot_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+      
+      - name: Run integration tests
+        run: pnpm test:integration
+        env:
+          MONGODB_URI: mongodb://localhost:27017/jobcopilot_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+      
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      
+      - name: Build API
+        run: pnpm build:api
+      
+      - name: Build Web
+        run: pnpm build:web
+      
+      - name: Build Extension
+        run: pnpm build:extension
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            apps/api/dist
+            apps/web/.next
+            apps/extension/dist
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.api
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/jobcopilot-api:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/jobcopilot-api:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/jobcopilot-api:buildcache,mode=max
+      
+      - name: Build and push Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.web
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/jobcopilot-web:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/jobcopilot-web:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/jobcopilot-web:buildcache,mode=max
+
+  deploy:
+    needs: docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to AWS ECS
+        run: |
+          # Update ECS task definition
+          aws ecs update-service --cluster jobcopilot --service api-service --force-new-deployment
+          aws ecs update-service --cluster jobcopilot --service web-service --force-new-deployment
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
